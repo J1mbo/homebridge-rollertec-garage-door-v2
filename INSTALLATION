@@ -1,0 +1,71 @@
+WEB SERVER INSTALLATION
+
+This plugin utilises a web server that should be deployed on a Raspberry Pi physically connected to the garage door controller to expose a simple API to the door. This file details how to install the web server.
+
+When interfacing to Rollertec doors, the Lo-tech Rollertec Interface provides robust physical connection, see:
+https://www.lo-tech.co.uk/wiki/Lo-tech_PDT_RollerTec_Interface
+
+
+1. Install Python and dependencies:
+
+  $ sudo pip install Flask cryptography
+
+
+2. Deploy the web server and configure as a systemd service (note: assumes user 'www-data' exists on the system):
+
+  Create a folder and copy the files:
+
+  $ sudo mkdir /opt/garagedoor_web_server
+  $ sudo cp garagedoor_web_server.py /opt/garagedoor_web_server/
+  $ sudo cp garagedoor_web_server.service /etc/systemd/system/
+
+Set the permissions on the folder and enable www-data to access GPIO:
+
+  $ sudo chown -R www-data:www-data /opt/garagedoor_web_server
+  $ sudo usermod -a -G gpio www-data
+
+Reload systemctl:
+
+  $ sudo systemctl daemon-reload
+
+
+3. Enable the web server (which will start automatically at boot):
+
+  $ sudo systemctl enable garagedoor_web_server.service
+  Created symlink /etc/systemd/system/multi-user.target.wants/garagedoor_web_server.service → /etc/systemd/system/garagedoor_web_server.service.
+
+
+4. Start the web server:
+
+  $ sudo systemctl start garagedoor_web_server.service
+  $ sudo systemctl status garagedoor_web_server.service
+  ● garagedoor_web_server.service - Lo-tech Garage Door Web Server (port 8443)
+     Loaded: loaded (/etc/systemd/system/garagedoor_web_server.service; enabled; vendor preset: enabled)
+     Active: active (running) since Sun 2025-03-23 07:36:57 GMT; 1s ago
+   Main PID: 10282 (python)
+      Tasks: 1 (limit: 2059)
+     CGroup: /system.slice/garagedoor_web_server.service
+             └─10282 python /opt/garagedoor_web_server/garagedoor_web_server.py
+
+  Mar 23 07:36:57 GarageDoor systemd[1]: Started Lo-tech Garage Door Web Server (port 8443).
+
+
+Then reboot and check the web server is accessible - using a browser, go to: https://[ip-address]:8443/status
+
+This should return "doorState":"unconfigured"
+
+
+CHECKING LOGS:
+
+  sudo journalctl -u garagedoor_web_service.service
+
+OR on older OS,
+
+  cat /var/log/syslog | grep garagedoor
+
+NOTES:
+
+1. The first time the web server is started, it will create it's own self-signed SSL certificate. This ensures that the preshared key is encrypted in transit and so not visible using a network packet sniffer.
+2. Since a self-signed certificate is used, the Homebridge plugin will reject commands if the certificate changes to provide some protection against 'man-in-the-middle' attacks. However, since the certificate is queried each time the plugin launches, it will accept whatever certificate is presented when Homebridge (or it's child bridge) is launched.
+3. When first installed, the web server waits in an 'unconfigured' state and the Homebridge plugin will set the PSK when it first starts. From then on, the PSK is required to access the API (and therefore open or close the door).
+

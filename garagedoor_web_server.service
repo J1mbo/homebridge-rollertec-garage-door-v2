@@ -1,0 +1,18 @@
+[Unit]
+Description=Lo-tech Garage Door Web Server (port 8443)
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/garagedoor_web_server
+ExecStart=/usr/bin/env python /opt/garagedoor_web_server/garagedoor_web_server.py
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+SyslogIdentifier=garagedoor_web_service
+
+[Install]
+WantedBy=multi-user.target
+

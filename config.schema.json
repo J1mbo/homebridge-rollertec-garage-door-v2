@@ -1,0 +1,65 @@
+{
+  "pluginAlias": "RollertecGarageDoor-v2",
+  "pluginType": "accessory",
+  "headerDisplay": "Plugin to control garage doors via the included Python web server.",
+  "footerDisplay": "The web server must be manually installed and configured - see INSTALLATION for details.",
+  "singular": false,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "Garage Door",
+        "required": true
+      },
+      "doorServer": {
+        "title": "Door Server:",
+        "description": "IP address or resolvable hostname of the web server used to access this door",
+        "default": "127.0.0.1",
+        "type": "string",
+        "required": true
+      },
+      "doorServerPort": {
+        "title": "Door Server Port",
+        "description": "Port used by web server",
+        "default": "8443",
+        "type": "number",
+        "required": true
+      },
+      "doorPSK": {
+        "title": "Pre-shared Key:",
+        "description": "The passphrase to be used to authenticate with the web server",
+        "default": "ChangeMeNow",
+        "type": "string",
+        "required": true
+      },
+      "doorSerialNumber": {
+        "title": "PDT Rollertec Serial Number",
+        "type": "string",
+        "required": false
+      },
+      "ignore_errors": {
+        "title": "Ignore Errors (surpresses door jammed)",
+        "type": "boolean"
+      }
+    }
+  },
+  "form": [
+    "name",
+    "doorServer",
+    "doorServerPort",
+    "doorPSK",
+    "doorSerialNumber",
+    {
+      "type": "fieldset",
+      "expandable": true,
+      "title": "Advanced Settings",
+      "description": "These settings don't normally need to be changed.",
+      "items": [
+        "ignore_errors"
+      ]
+    }
+  ],
+  "display": null
+}
