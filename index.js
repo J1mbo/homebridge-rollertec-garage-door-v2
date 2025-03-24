@@ -2,7 +2,7 @@ const https = require('https');
 const EventSource = require('eventsource');  // Ensure you install this package via npm install eventsource
 
 module.exports = (api) => {
-  api.registerAccessory('RollertecGarageDoor-v2', GarageDoorWebAccessory);
+  api.registerAccessory('homebridge-rollertec-garage-door-v2', GarageDoorWebAccessory);
 };
 
 class GarageDoorWebAccessory {
@@ -14,16 +14,23 @@ class GarageDoorWebAccessory {
     this.Characteristic = this.api.hap.Characteristic;
 
     // Configuration for the remote web server
-    this.name = config.name || 'Garage Door';
-    this.serverIP = config.doorServer || "127.0.0.1";  // e.g., "192.168.1.100"
-    this.serverPort = config.doorServerPort || 8443;  // Use correct port for HTTPS
+    this.name             = config.name               || 'Garage Door';
+    this.doorSerialNumber = config.doorSerialNumber   || '(not set)';
+    this.serverIP         = config.doorServer         || "127.0.0.1";  // e.g., "192.168.1.100"
+    this.serverPort       = config.doorServerPort     || 8443;  // Use correct port for HTTPS
     // Use doorPSK from configuration for both configuration and all API calls.
-    this.doorPSK = config.doorPSK;
-    this.apiKey = null; // Will be set after initialization
+    this.doorPSK          = config.doorPSK;
+    this.apiKey           = null; // Will be set after initialization
 
     // Certificate pinning properties.
     this.expectedFingerprint = null;
     this.certificateError = false;
+
+    // create an information service...
+    this.informationService = new this.Service.AccessoryInformation()
+      .setCharacteristic(this.Characteristic.Manufacturer, "Lo-tech")
+      .setCharacteristic(this.Characteristic.Model, "PDT Rollertech V2")
+      .setCharacteristic(this.Characteristic.SerialNumber, this.doorSerialNumber);
 
     // Create the Garage Door service
     this.doorService = new this.Service.GarageDoorOpener(this.name);
@@ -44,10 +51,21 @@ class GarageDoorWebAccessory {
     this.currentDoorState = this.Characteristic.CurrentDoorState.CLOSED;
     this.targetDoorState = this.Characteristic.TargetDoorState.CLOSED;
 
-    // Begin initialization: check server configuration and configure if needed.
+    // Begin initialization
+    this.retryInitialization();
+  }
+
+  retryInitialization() {
     this.initializeConfiguration(() => {
-      // Once configuration is done, connect the SSE event stream.
-      this.connectSSE();
+      if (this.apiKey) {
+        this.log("Initialization successful. Proceeding to connect SSE.");
+        this.connectSSE();
+      } else {
+        this.log("Initialization failed (apiKey is null). Retrying in 5 seconds...");
+        setTimeout(() => {
+          this.retryInitialization();
+        }, 5000);
+      }
     });
   }
 
@@ -146,6 +164,38 @@ class GarageDoorWebAccessory {
     req.end();
   }
 
+
+  refreshStatus() {
+    const options = {
+      hostname: this.serverIP,
+      port: this.serverPort,
+      path: `/status?api_key=${this.apiKey}`,
+      method: 'GET',
+      rejectUnauthorized: false,
+      checkServerIdentity: this.checkCert.bind(this)
+    };
+
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      res.on('data', chunk => { responseData += chunk; });
+      res.on('end', () => {
+        try {
+          const result = JSON.parse(responseData);
+          this.log("Refreshed status: " + responseData);
+          this.updateDoorState(result);
+        } catch (e) {
+          this.log("Error parsing /status response during refresh: " + e);
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      this.log("Error fetching status during refresh: " + e);
+    });
+    req.end();
+  }
+
+
   connectSSE() {
     // Create an HTTPS agent with our certificate pinning check.
     const httpsAgent = new https.Agent({
@@ -157,6 +207,7 @@ class GarageDoorWebAccessory {
     // Pass our custom agent to EventSource.
     const eventSourceInitDict = { agent: httpsAgent };
     this.eventSource = new EventSource(sseUrl, eventSourceInitDict);
+
     this.eventSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -166,9 +217,20 @@ class GarageDoorWebAccessory {
         this.log("Error parsing SSE event: " + e);
       }
     };
+
     this.eventSource.onerror = (err) => {
       this.log("SSE connection error: " + err);
-      // Optionally, implement reconnection logic here.
+      // Close the current connection to clean up.
+      if (this.eventSource) {
+        this.eventSource.close();
+      }
+      // Immediately refresh the door state by querying /status.
+      this.refreshStatus();
+      // Attempt to reconnect after a delay (e.g., 5 seconds).
+      setTimeout(() => {
+        this.log("Attempting to reconnect SSE...");
+        this.connectSSE();
+      }, 5000);
     };
   }
 
@@ -291,8 +353,10 @@ class GarageDoorWebAccessory {
   }
 
   getServices() {
-    return [this.doorService, this.temperatureService];
+    return [
+      this.informationService,
+      this.doorService,
+      this.temperatureService
+    ];
   }
 }
-
-module.exports = GarageDoorWebAccessory;

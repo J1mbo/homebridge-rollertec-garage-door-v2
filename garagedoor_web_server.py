@@ -10,9 +10,9 @@ Provides endpoints:
    /events   an SSE endpoint that pushes door state updates.
    /set-key  sets the API key remotely (allowed only if not yet configured).
 
-This version implements advanced logic for determining door state
-by analyzing LED sensor events (as in garagedoormonitor.py) and is compatible
-with both Python 2.7 and 3.x.
+This version uses LED event buffering with suppression after an action.
+After an open or close command, the LED event buffer is cleared and new events are recorded.
+However, door state interpretation (and hence SSE updates) are deferred until at least 3 seconds of data have been collected.
 """
 
 from __future__ import print_function
@@ -32,10 +32,8 @@ try:
     logging.getLogger().addHandler(journal_handler)
     logging.getLogger().setLevel(logging.INFO)
 except ImportError:
-    # Fall back to basic configuration if JournalHandler is not available.
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='[%(levelname)s] %(message)s')
 
-# Use the correct Queue module for Python 2 or 3.
 try:
     from queue import Queue
 except ImportError:
@@ -66,7 +64,7 @@ if os.path.exists(API_KEY_FILE):
         API_KEY = f.read().strip()
     logging.info("Loaded existing API key.")
 else:
-    API_KEY = None  # System unconfigured until a key is set
+    API_KEY = None
     logging.info("No API key configured yet.")
 
 # GPIO definitions:
@@ -85,37 +83,19 @@ LED_RED    = 1
 LED_GREEN  = 2
 LED_ORANGE = 3
 
-STATE_NOINPUT   = 0
-STATE_OPEN      = 1
-STATE_OPENING   = 2
-STATE_CLOSED    = 3
-STATE_CLOSING   = 4
-STATE_ERROR     = 5
-INDETERMINATE   = 6
-
-def state_val_to_text(state):
-    if state == STATE_NOINPUT:
-        return "STOPPED"
-    elif state == STATE_OPEN:
-        return "OPEN"
-    elif state == STATE_OPENING:
-        return "OPENING"
-    elif state == STATE_CLOSED:
-        return "CLOSED"
-    elif state == STATE_CLOSING:
-        return "CLOSING"
-    elif state == STATE_ERROR:
-        return "STOPPED"
-    elif state == INDETERMINATE:
-        return "INDETERMINATE"
-    else:
-        return "UNKNOWN"
-
 # ======= Global Variables =======
 door_state = "UNKNOWN"  # current door state as text
 temperature = 0.0
-event_list = []  # List of (timestamp, led_color) tuples.
+# event_list stores (timestamp, led_value) tuples.
+event_list = []
 state_lock = threading.Lock()
+
+# Sliding window duration (in seconds) for LED event analysis.
+LED_EVENT_WINDOW = 3.0
+
+# Suppression mode: when True, we are waiting for a fresh 3-sec buffer after an action.
+suppress_mode = False
+suppression_start_time = 0.0
 
 # ======= SSE Push Mechanism =======
 subscribers = []
@@ -142,158 +122,194 @@ def led_colour(open_val, close_val):
         return LED_ORANGE
     return LED_OFF
 
-def trim_events(mode):
+def clean_event_list():
     """
-    Trim the global event_list to remove events older than 2 seconds.
-    If mode == 1, the most recent event is retained even if older.
+    Remove events older than LED_EVENT_WINDOW seconds.
     """
     global event_list
     now = time.time()
-    while len(event_list) > 1 and (now - event_list[0][0] > 2):
+    while event_list and (now - event_list[0][0] > LED_EVENT_WINDOW):
         event_list.pop(0)
 
-def determine_door_state():
+def classify_door_state():
     """
-    Analyze the event_list to determine the current door state.
+    Analyze the sliding window of LED events and classify the door state.
+    Uses the predominant LED value and transition frequency.
     """
-    global event_list
-    now = time.time()
-    trim_events(1)
+    clean_event_list()
     if not event_list:
-        return state_val_to_text(STATE_NOINPUT)
-    if len(event_list) == 1:
-        t, led = event_list[0]
-        if now - t > 0.3:
-            if led == LED_OFF:
-                return state_val_to_text(STATE_NOINPUT)
-            elif led == LED_GREEN:
-                return state_val_to_text(STATE_OPEN)
-            elif led == LED_RED:
-                return state_val_to_text(STATE_CLOSED)
-            elif led == LED_ORANGE:
-                return state_val_to_text(STATE_ERROR)
+        return "No Input"
+
+    window_duration = event_list[-1][0] - event_list[0][0]
+    if window_duration <= 0:
+        window_duration = 1.0
+
+    transitions = 0
+    previous = event_list[0][1]
+    for t, led in event_list[1:]:
+        if led != previous:
+            transitions += 1
+        previous = led
+    frequency = transitions / window_duration
+
+    counts = {LED_OFF: 0, LED_GREEN: 0, LED_RED: 0, LED_ORANGE: 0}
+    for _, led in event_list:
+        counts[led] += 1
+    total_events = len(event_list)
+    predominant_led = max(counts, key=counts.get)
+    ratio = counts[predominant_led] / float(total_events)
+
+    if ratio > 0.8:
+        if predominant_led == LED_OFF:
+            return "No Input"
+        elif predominant_led == LED_GREEN:
+            return "OPEN"
+        elif predominant_led == LED_RED:
+            return "CLOSED"
+        elif predominant_led == LED_ORANGE:
+            return "MANUALLY STOPPED"
+
+    if predominant_led == LED_GREEN:
+        if 0.7 <= frequency <= 1.3:
+            return "OPENING"
+    elif predominant_led == LED_RED:
+        if 0.7 <= frequency <= 1.3:
+            return "CLOSING"
+    elif predominant_led == LED_ORANGE:
+        if frequency >= 3.0:
+            return "ERROR"
         else:
-            return "INDETERMINATE"
-    # More than one event exists.
-    last_time, last_led = event_list[-1]
-    if now - last_time > 2:
-        if last_led == LED_OFF:
-            return state_val_to_text(STATE_NOINPUT)
-        elif last_led == LED_GREEN:
-            return state_val_to_text(STATE_OPEN)
-        elif last_led == LED_RED:
-            return state_val_to_text(STATE_CLOSED)
-        elif last_led == LED_ORANGE:
-            return state_val_to_text(STATE_ERROR)
+            return "MANUALLY STOPPED"
+
+    if frequency >= 3.0:
+        return "ERROR"
+
+    return "INDETERMINATE"
+
+def _check_suppression():
+    """
+    If we are in suppression mode, check whether we have accumulated at least
+    LED_EVENT_WINDOW seconds worth of events (or a backup timer has elapsed).
+    If so, disable suppression.
+    """
+    global suppress_mode, suppression_start_time
+    now = time.time()
+    if event_list:
+        span = event_list[-1][0] - event_list[0][0]
     else:
-        minduration = 2
-        lasteventtime = None
-        error_flag = False
-        for event in event_list:
-            t, led = event
-            if lasteventtime is None:
-                lasteventtime = t
-            else:
-                dt = t - lasteventtime
-                if dt < minduration:
-                    minduration = dt
-                lasteventtime = t
-            if led == LED_ORANGE:
-                error_flag = True
-        if error_flag:
-            return state_val_to_text(STATE_ERROR)
-        if minduration < 0.5:
-            return "INDETERMINATE"
-        else:
-            if len(event_list) == 2 and event_list[0][1] == LED_OFF:
-                if event_list[1][1] == LED_GREEN:
-                    return state_val_to_text(STATE_OPENING)
-                elif event_list[1][1] == LED_RED:
-                    return state_val_to_text(STATE_CLOSING)
-        return "INDETERMINATE"
+        span = 0
+    # If we have a full window of events or 3 seconds have elapsed since suppression began, disable suppression.
+    if span >= LED_EVENT_WINDOW or (now - suppression_start_time) >= LED_EVENT_WINDOW:
+        suppress_mode = False
 
 def update_state():
     """
-    Force a fresh sensor reading and update door_state.
+    Force a fresh sensor reading, record the LED event, and update door_state.
+    When suppression mode is active, record events but do not interpret them until
+    a full LED_EVENT_WINDOW of data has been gathered.
     """
-    global door_state
+    global door_state, suppress_mode
     with state_lock:
-        current_time = time.time()
+        now = time.time()
+        # If suppression is active, check if we can end it.
+        if suppress_mode:
+            # Continue recording events
+            open_val = GPIO.input(SENSOR_OPEN)
+            close_val = GPIO.input(SENSOR_CLOSE)
+            led = led_colour(open_val, close_val)
+            if not event_list or event_list[-1][1] != led:
+                event_list.append((now, led))
+            _check_suppression()
+            return door_state  # Return the current state (e.g. OPENING or CLOSING)
+
+        # Normal mode: record the event and interpret it.
         open_val = GPIO.input(SENSOR_OPEN)
         close_val = GPIO.input(SENSOR_CLOSE)
         led = led_colour(open_val, close_val)
-        if not event_list or (event_list and event_list[-1][1] != led):
-            event_list.append((current_time, led))
-            logging.debug("Appended new sensor event: time=%s, led=%s", current_time, led)
-        new_state = determine_door_state()
+        if not event_list or event_list[-1][1] != led:
+            event_list.append((now, led))
+        new_state = classify_door_state()
         if new_state != door_state:
             logging.info("Door state changed from %s to %s", door_state, new_state)
-        door_state = new_state
-        return new_state
+            door_state = new_state
+            event_data = json.dumps({"doorState": door_state, "temperature": temperature})
+            push_event(event_data)
+        return door_state
 
-# ======= GPIO Setup =======
-GPIO.setwarnings(False)
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(SENSOR_OPEN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(SENSOR_CLOSE, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(OPEN_CMD_PIN, GPIO.OUT)
-GPIO.setup(CLOSE_CMD_PIN, GPIO.OUT)
-GPIO.output(OPEN_CMD_PIN, GPIO.LOW)
-GPIO.output(CLOSE_CMD_PIN, GPIO.LOW)
-logging.info("GPIO initialized.")
-
-# ======= DS18B20 Temperature Reading =======
-def read_temperature():
-    sensor_folder = None
-    if DS18B20_SENSOR_ID is None:
-        for d in os.listdir(DS18B20_BASE):
-            if d.startswith("28-"):
-                sensor_folder = d
-                break
-    else:
-        sensor_folder = DS18B20_SENSOR_ID
-
-    if sensor_folder:
-        sensor_file = os.path.join(DS18B20_BASE, sensor_folder, "w1_slave")
-        try:
-            with open(sensor_file, "r") as f:
-                lines = f.readlines()
-            if not lines[0].strip().endswith("YES"):
-                logging.warning("Temperature sensor read: invalid checksum.")
-                return None
-            equals_pos = lines[1].find("t=")
-            if equals_pos != -1:
-                temp_str = lines[1][equals_pos+2:]
-                temp_val = float(temp_str) / 1000.0
-                return temp_val
-        except Exception as e:
-            logging.error("Temperature read error: %s", e)
-            return None
-    return None
+# ======= LED Status Updater Thread =======
+def led_status_updater():
+    """
+    Every 1 second, re-read the LED input status and append a sample to the event_list.
+    If suppression mode is active, do not interpret the data until the buffer spans LED_EVENT_WINDOW.
+    """
+    global door_state, suppress_mode
+    logging.info("Starting LED status updater thread.")
+    while True:
+        with state_lock:
+            now = time.time()
+            # If suppression is active, record events and check if we can end suppression.
+            if suppress_mode:
+                if event_list and (now - event_list[-1][0] >= 1.0):
+                    open_val = GPIO.input(SENSOR_OPEN)
+                    close_val = GPIO.input(SENSOR_CLOSE)
+                    led = led_colour(open_val, close_val)
+                    event_list.append((now, led))
+                _check_suppression()
+            else:
+                # Normal mode: record event if enough time has elapsed since the last sample.
+                if not event_list or (now - event_list[-1][0]) >= 1.0:
+                    open_val = GPIO.input(SENSOR_OPEN)
+                    close_val = GPIO.input(SENSOR_CLOSE)
+                    led = led_colour(open_val, close_val)
+                    event_list.append((now, led))
+                    new_state = classify_door_state()
+                    if new_state != door_state:
+                        logging.info("LED updater: door state changed from %s to %s", door_state, new_state)
+                        door_state = new_state
+                        event_data = json.dumps({"doorState": door_state, "temperature": temperature})
+                        push_event(event_data)
+        time.sleep(1)
 
 # ======= GPIO Event Callback =======
 def door_sensor_callback(channel):
-    global door_state, event_list
+    """
+    Callback triggered by GPIO events.
+    If suppression mode is active, record the event but do not trigger classification
+    until a full LED_EVENT_WINDOW of data is available.
+    """
+    global door_state, suppress_mode
     with state_lock:
-        current_time = time.time()
+        now = time.time()
+        if suppress_mode:
+            # Record the new event and check suppression.
+            open_val = GPIO.input(SENSOR_OPEN)
+            close_val = GPIO.input(SENSOR_CLOSE)
+            led = led_colour(open_val, close_val)
+            if not event_list or event_list[-1][1] != led:
+                event_list.append((now, led))
+            _check_suppression()
+            return
+        # Normal mode: record the event and update classification.
         open_val = GPIO.input(SENSOR_OPEN)
         close_val = GPIO.input(SENSOR_CLOSE)
         led = led_colour(open_val, close_val)
-        if not event_list or (event_list and event_list[-1][1] != led):
-            event_list.append((current_time, led))
-            logging.debug("Sensor callback on channel %s: event appended (time=%s, led=%s).", channel, current_time, led)
-        new_state = determine_door_state()
+        if not event_list or event_list[-1][1] != led:
+            event_list.append((now, led))
+        new_state = classify_door_state()
         if new_state != door_state:
             logging.info("Sensor callback: door state changed from %s to %s", door_state, new_state)
             door_state = new_state
             event_data = json.dumps({"doorState": door_state, "temperature": temperature})
             push_event(event_data)
 
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SENSOR_OPEN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(SENSOR_CLOSE, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.add_event_detect(SENSOR_OPEN, GPIO.BOTH, callback=door_sensor_callback, bouncetime=200)
 GPIO.add_event_detect(SENSOR_CLOSE, GPIO.BOTH, callback=door_sensor_callback, bouncetime=200)
 logging.info("GPIO event detection set.")
 
-# ======= Background Temperature Updater =======
+# ======= Temperature Updater Thread =======
 def temperature_updater():
     global temperature, door_state
     logging.info("Starting temperature updater thread.")
@@ -308,20 +324,46 @@ def temperature_updater():
                     push_event(event_data)
         time.sleep(5)
 
-t = threading.Thread(target=temperature_updater)
-t.daemon = True
-t.start()
+def read_temperature():
+    sensor_folder = None
+    if DS18B20_SENSOR_ID is None:
+        for d in os.listdir(DS18B20_BASE):
+            if d.startswith("28-"):
+                sensor_folder = d
+                break
+    else:
+        sensor_folder = DS18B20_SENSOR_ID
+    if sensor_folder:
+        sensor_file = os.path.join(DS18B20_BASE, sensor_folder, "w1_slave")
+        try:
+            with open(sensor_file, "r") as f:
+                lines = f.readlines()
+            if not lines[0].strip().endswith("YES"):
+                logging.warning("Temperature sensor read: invalid checksum.")
+                return None
+            equals_pos = lines[1].find("t=")
+            if equals_pos != -1:
+                temp_str = lines[1][equals_pos+2:]
+                temp_val = float(temp_str) / 1000.0
+                temp_val = round(temp_val * 2) / 2.0  # round to nearest 0.5C
+                return temp_val
+        except Exception as e:
+            logging.error("Temperature read error: %s", e)
+            return None
+    return None
 
-# ======= Security: API Key Check =======
+# ======= API Key Validator =======
+
 def require_api_key(func):
     def wrapper(*args, **kwargs):
         key = request.args.get('api_key') or request.headers.get('X-API-KEY')
         if key != API_KEY:
-            logging.warning("Unauthorized access attempt to %s from %s", request.path, request.remote_addr)
+            logging.warning("Unauthorized access attempt to %s", request.path)
             abort(401)
         return func(*args, **kwargs)
     wrapper.__name__ = func.__name__
     return wrapper
+
 
 # ======= API Endpoints =======
 
@@ -329,28 +371,24 @@ def require_api_key(func):
 def status():
     """
     Returns current door state and temperature.
+    The LED event buffer is maintained in the background.
     """
     global API_KEY
     client_ip = request.remote_addr
     logging.info("Status endpoint accessed by %s", client_ip)
     if API_KEY is None:
         return jsonify({"doorState": "unconfigured", "temperature": temperature})
-    else:
-        key = request.args.get('api_key') or request.headers.get('X-API-KEY')
-        if key != API_KEY:
-            logging.warning("Unauthorized /status access attempt from %s", client_ip)
-            abort(401)
-        update_state()
-        with state_lock:
-            current_state = door_state
-            temp = temperature
-        return jsonify({"doorState": current_state, "temperature": temp})
+    key = request.args.get('api_key') or request.headers.get('X-API-KEY')
+    if key != API_KEY:
+        logging.warning("Unauthorized /status access attempt from %s", client_ip)
+        abort(401)
+    with state_lock:
+        current_state = door_state
+        temp = temperature
+    return jsonify({"doorState": current_state, "temperature": temp})
 
 @app.route('/set-key', methods=['POST'])
 def set_key():
-    """
-    Sets the API key remotely if not yet configured.
-    """
     global API_KEY
     client_ip = request.remote_addr
     logging.info("Set-key endpoint accessed by %s", client_ip)
@@ -380,32 +418,50 @@ def set_key():
 @app.route('/open', methods=['POST'])
 @require_api_key
 def open_door():
+    """
+    Initiates door opening.
+    Immediately sets door_state to OPENING, clears the LED event buffer,
+    and enters suppression mode so that LED events are recorded but not interpreted
+    until 3 seconds of new data have been collected.
+    """
+    global door_state, event_list, suppress_mode, suppression_start_time
     client_ip = request.remote_addr
     logging.info("Open door command received from %s", client_ip)
+    with state_lock:
+        door_state = "OPENING"
+        event_list = []  # Invalidate LED event buffer.
+        suppress_mode = True
+        suppression_start_time = time.time()
+        event_data = json.dumps({"doorState": door_state, "temperature": temperature})
+        push_event(event_data)
     GPIO.output(OPEN_CMD_PIN, GPIO.HIGH)
     time.sleep(0.5)
     GPIO.output(OPEN_CMD_PIN, GPIO.LOW)
-    with state_lock:
-        door_state_local = "OPENING"
-        door_state_update = door_state_local
-        event_data = json.dumps({"doorState": door_state_update, "temperature": temperature})
-        push_event(event_data)
     logging.info("Door opening initiated.")
     return jsonify({"result": "OPENING"})
 
 @app.route('/close', methods=['POST'])
 @require_api_key
 def close_door():
+    """
+    Initiates door closing.
+    Immediately sets door_state to CLOSING, clears the LED event buffer,
+    and enters suppression mode so that LED events are recorded but not interpreted
+    until 3 seconds of new data have been collected.
+    """
+    global door_state, event_list, suppress_mode, suppression_start_time
     client_ip = request.remote_addr
     logging.info("Close door command received from %s", client_ip)
+    with state_lock:
+        door_state = "CLOSING"
+        event_list = []  # Invalidate LED event buffer.
+        suppress_mode = True
+        suppression_start_time = time.time()
+        event_data = json.dumps({"doorState": door_state, "temperature": temperature})
+        push_event(event_data)
     GPIO.output(CLOSE_CMD_PIN, GPIO.HIGH)
     time.sleep(0.5)
     GPIO.output(CLOSE_CMD_PIN, GPIO.LOW)
-    with state_lock:
-        door_state_local = "CLOSING"
-        door_state_update = door_state_local
-        event_data = json.dumps({"doorState": door_state_update, "temperature": temperature})
-        push_event(event_data)
     logging.info("Door closing initiated.")
     return jsonify({"result": "CLOSING"})
 
@@ -428,7 +484,6 @@ def events():
 
 # --- Begin: Self-signed Certificate Generation ---
 def get_primary_ip():
-    """Determine the host's primary IPv4 address."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('8.8.8.8', 80))
@@ -441,20 +496,14 @@ def get_primary_ip():
     return ip
 
 def generate_self_signed_cert(cert_file, key_file):
-    """Generate a self-signed certificate with the host's primary IPv4 address as the CN."""
     logging.info("Generating self-signed certificate...")
-    key = rsa.generate_private_key(
-         public_exponent=65537,
-         key_size=2048,
-         backend=default_backend()
-    )
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
     host_ip = get_primary_ip()
     try:
         if not isinstance(host_ip, unicode):
             host_ip = unicode(host_ip, 'utf-8')
     except NameError:
         pass
-
     subject = issuer = x509.Name([
          x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
          x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"State"),
@@ -462,42 +511,41 @@ def generate_self_signed_cert(cert_file, key_file):
          x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Self-Signed"),
          x509.NameAttribute(NameOID.COMMON_NAME, host_ip),
     ])
-    cert = x509.CertificateBuilder().subject_name(subject) \
-         .issuer_name(issuer) \
-         .public_key(key.public_key()) \
-         .serial_number(x509.random_serial_number()) \
-         .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1)) \
-         .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365)) \
-         .add_extension(x509.SubjectAlternativeName([x509.DNSName(host_ip)]), critical=False) \
+    cert = x509.CertificateBuilder().subject_name(subject)\
+         .issuer_name(issuer)\
+         .public_key(key.public_key())\
+         .serial_number(x509.random_serial_number())\
+         .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))\
+         .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))\
+         .add_extension(x509.SubjectAlternativeName([x509.DNSName(host_ip)]), critical=False)\
          .sign(key, hashes.SHA256(), default_backend())
     try:
         with open(cert_file, "wb") as f:
              f.write(cert.public_bytes(serialization.Encoding.PEM))
         with open(key_file, "wb") as f:
-             f.write(key.private_bytes(
-                 encoding=serialization.Encoding.PEM,
-                 format=serialization.PrivateFormat.TraditionalOpenSSL,
-                 encryption_algorithm=serialization.NoEncryption()
-             ))
+             f.write(key.private_bytes(encoding=serialization.Encoding.PEM,
+                                        format=serialization.PrivateFormat.TraditionalOpenSSL,
+                                        encryption_algorithm=serialization.NoEncryption()))
         logging.info("Self-signed certificate and key saved to %s and %s", cert_file, key_file)
     except Exception as e:
         logging.error("Error saving self-signed certificate: %s", e)
 # --- End: Self-signed Certificate Generation ---
 
-# ======= Initial Sensor Read and Main Runner =======
 if __name__ == '__main__':
     logging.info("Garage Door Web Server starting up.")
-    # Brief wait for initial sensor read.
     time.sleep(0.5)
     update_state()
-
-    # Check for certificate files; generate if missing.
     CERT_FILE = 'cert.pem'
     KEY_FILE = 'key.pem'
     if not (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)):
         generate_self_signed_cert(CERT_FILE, KEY_FILE)
-
     ssl_context = (CERT_FILE, KEY_FILE)
+    t_temp = threading.Thread(target=temperature_updater)
+    t_temp.daemon = True
+    t_temp.start()
+    t_led = threading.Thread(target=led_status_updater)
+    t_led.daemon = True
+    t_led.start()
     logging.info("Starting Flask server on 0.0.0.0:8443 with SSL.")
     app.run(host='0.0.0.0', port=8443, ssl_context=ssl_context, threaded=True)
 

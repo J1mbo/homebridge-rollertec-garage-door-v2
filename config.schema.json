@@ -1,5 +1,5 @@
 {
-  "pluginAlias": "RollertecGarageDoor-v2",
+  "pluginAlias": "homebridge-rollertec-garage-door-v2",
   "pluginType": "accessory",
   "headerDisplay": "Plugin to control garage doors via the included Python web server.",
   "footerDisplay": "The web server must be manually installed and configured - see INSTALLATION for details.",
@@ -23,9 +23,9 @@
       "doorServerPort": {
         "title": "Door Server Port",
         "description": "Port used by web server",
-        "default": "8443",
+        "default": 8443,
         "type": "number",
-        "required": true
+        "required": false
       },
       "doorPSK": {
         "title": "Pre-shared Key:",
@@ -48,7 +48,6 @@
   "form": [
     "name",
     "doorServer",
-    "doorServerPort",
     "doorPSK",
     "doorSerialNumber",
     {
@@ -57,7 +56,7 @@
       "title": "Advanced Settings",
       "description": "These settings don't normally need to be changed.",
       "items": [
-        "ignore_errors"
+        "doorServerPort", "ignore_errors"
       ]
     }
   ],

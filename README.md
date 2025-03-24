@@ -22,7 +22,7 @@ Subscribable events:
 This plugin works with two components:
 
 1. The plugin itself, index.js, which is run on the HomeBridge server.
-2. A Python web server, garagedoor-web-server.py, which provides control of the door and is deployed on a Raspberry Pi physically connected to the garage door. Please see below.
+2. A Python web server, garagedoor_web_server.py, which provides control of the door and is deployed on a Raspberry Pi physically connected to the garage door. Please see below.
 
 The plugin can be adapted to other door openers by modifying the web server as needed (ChatGPT is your friend).
 
@@ -49,6 +49,12 @@ Note that:
 
 1. Anyone with access to this key and network access to the web server can potentially open the door.
 2. Applying firewall rules to the Pi to restrict access to the Homebridge server would be preferable.
+
+If you need to reset the preshared key for any reason:
+
+1. Delete /opt/garagedoor_web_server/api_key.txt on the web server and restart the service
+2. Update the key to whatever you want through the pluging settings
+3. Restart Homebridge (or the child bridge for the plugin).
 
 
 # KNOWN ISSUES

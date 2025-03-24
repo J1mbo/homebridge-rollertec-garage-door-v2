@@ -1,4 +1,4 @@
-# [2.0.0]
+# [2.0.1]
 
 *** HomeBridge Plugin for Rollertec Garage Door Controllers (v2) ***
 
@@ -9,7 +9,7 @@ This plugin enables HomeKit to control a garage door based on the popular PDT Ro
 This plugin works with two components:
 
 1. The plugin itself (index.js) which is run on the HomeBridge server and will be installed now.
-2. A Python web server, garagedoor-web-server.py, which provides control of the door and is deployed on a Raspberry Pi physically connected to the garage door. Please see below.
+2. A Python web server, garagedoor_web_server.py, which provides control of the door and is deployed on a Raspberry Pi physically connected to the garage door. Please see below.
 
 The plugin can be adapted to other door openers by modifying the web server as needed (ChatGPT is your friend).
 

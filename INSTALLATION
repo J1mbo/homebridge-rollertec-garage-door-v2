@@ -68,4 +68,5 @@ NOTES:
 1. The first time the web server is started, it will create it's own self-signed SSL certificate. This ensures that the preshared key is encrypted in transit and so not visible using a network packet sniffer.
 2. Since a self-signed certificate is used, the Homebridge plugin will reject commands if the certificate changes to provide some protection against 'man-in-the-middle' attacks. However, since the certificate is queried each time the plugin launches, it will accept whatever certificate is presented when Homebridge (or it's child bridge) is launched.
 3. When first installed, the web server waits in an 'unconfigured' state and the Homebridge plugin will set the PSK when it first starts. From then on, the PSK is required to access the API (and therefore open or close the door).
+4. The above instructions assume it is being deployed on Raspbian. For other OS, it may be necessary to install Python (2.7 or above).
 
