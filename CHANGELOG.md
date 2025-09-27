@@ -1,8 +1,9 @@
-# [2.0.1]
+# [2.1.0]
 
 *** HomeBridge Plugin for Rollertec Garage Door Controllers (v2) ***
 
-NOTE: v2 works differently to v1 and is not a drop-in replacement. v1 should be removed before deploying v2.
+NOTE:   v2 works differently to v1 and is not a drop-in replacement. v1 should be removed before deploying v2.
+        *v2.1 has a new back-end server which depends on pigpio - see below*
 
 This plugin enables HomeKit to control a garage door based on the popular PDT Rollertec controller, when interfaced to a Raspberry Pi with the Lo-tech PDT Rollertec Interface kit. Please read the Important Information below, before continuing.
 
@@ -24,6 +25,13 @@ The web server must be deployed on the Raspberry Pi manually, and configured to 
 3. Updating Homebridge on Raspberry Pi, and the underlying OS, can be difficult and using this approach the Pi needs to only run the web server providing a reduced attack surface. Homebridge itself can be run on (for example) Ubuntu elsewhere, which can be easier to maintain.
 4. Easier to extend funcionality to other doors, since the plugin only needs the simple API provided by the web server.
 5. Reduced resource requirements means the web server can be deployed on any Pi board that is to hand.
+
+# V2.1
+
+Updated the Python web server, garagedoor_web_server.py, to better interpret the Rollertec LED flash codes.
+It should now provide a correct CLOSED -> OPENING -> OPEN -> CLOSING -> CLOSED transition (as viewed in Apple Home app) when the door is operated from the physical buttons, as well as via HomeKit.
+
+Note that the Python server now uses pigpio, which is installed but not enabled by default on recent Raspbian images. See INSTALLATION for details.
 
 
 # SECURITY
